@@ -52,9 +52,15 @@ def _kmeans_torch_double_chunked(
     max_points_per_centroid: int | None = 256,
     verbose: bool = False,
     use_triton: bool | None = None,
+    init_centroids: torch.Tensor | None = None,
+    spherical: bool = False,
 ):
     """
     An efficient kmeans implementation that minimises OOM risks on modern hardware by using conversative double chunking.
+    
+    Args:
+        spherical: If True, use spherical k-means (cosine similarity, normalized centroids).
+                  Data will be L2-normalized and distances computed as negative dot products.
 
     Returns
     -------
@@ -86,9 +92,21 @@ def _kmeans_torch_double_chunked(
     if n_samples < k:
         raise ValueError(f"Number of training points ({n_samples}) is less than k ({k}).")
 
-    # centroid init -- random is the only supported init
-    rand_indices = torch.randperm(n_samples)[:k]
-    centroids = data[rand_indices].clone().to(device=device, dtype=dtype)
+    # Normalize data if spherical k-means
+    if spherical:
+        data = torch.nn.functional.normalize(data, p=2.0, dim=1)
+        data_norms = torch.ones(n_samples, dtype=data.dtype, device=data.device)
+
+    # centroid init -- random or provided
+    if init_centroids is not None:
+        centroids = init_centroids.clone().to(device=device, dtype=dtype)
+        if spherical:
+            centroids = torch.nn.functional.normalize(centroids, p=2.0, dim=1)
+    else:
+        rand_indices = torch.randperm(n_samples)[:k]
+        centroids = data[rand_indices].clone().to(device=device, dtype=dtype)
+        if spherical:
+            centroids = torch.nn.functional.normalize(centroids, p=2.0, dim=1)
     prev_centroids = centroids.clone()
 
     labels = torch.empty(n_samples, dtype=torch.int64, device="cpu")  # Keep labels on CPU
@@ -125,8 +143,13 @@ def _kmeans_torch_double_chunked(
                     centroid_chunk = centroids[c_start:c_end]
                     centroid_chunk_norms = centroid_norms[c_start:c_end]
 
-                    dist_chunk = data_chunk_norms.unsqueeze(1) + centroid_chunk_norms.unsqueeze(0)
-                    dist_chunk = dist_chunk.addmm_(data_chunk, centroid_chunk.t(), alpha=-2.0, beta=1.0)
+                    if spherical:
+                        # Spherical k-means: negative dot product (maximize similarity)
+                        dist_chunk = -(data_chunk @ centroid_chunk.t())
+                    else:
+                        # L2 k-means: squared Euclidean distance
+                        dist_chunk = data_chunk_norms.unsqueeze(1) + centroid_chunk_norms.unsqueeze(0)
+                        dist_chunk = dist_chunk.addmm_(data_chunk, centroid_chunk.t(), alpha=-2.0, beta=1.0)
 
                     local_min_vals, local_min_ids = torch.min(dist_chunk, dim=1)
                     improved_mask = local_min_vals < best_dist
@@ -144,6 +167,10 @@ def _kmeans_torch_double_chunked(
         new_centroids = torch.zeros_like(centroids, device=device, dtype=dtype)
         non_empty = cluster_counts > 0
         new_centroids[non_empty] = (cluster_sums[non_empty] / cluster_counts[non_empty].unsqueeze(1)).to(dtype=dtype)
+
+        # Normalize centroids if spherical k-means
+        if spherical:
+            new_centroids[non_empty] = torch.nn.functional.normalize(new_centroids[non_empty], p=2.0, dim=1)
 
         empty_ids = (~non_empty).nonzero(as_tuple=True)[0]
         if len(empty_ids) > 0:
@@ -208,6 +235,9 @@ class FastKMeans:
     use_triton : bool | None, default=None
         Use the fast Triton backend for the assignment/update steps.
         If None, the Triton backend will be enabled for modern GPUs.
+    spherical : bool, default=False
+        If True, use spherical k-means (cosine similarity with L2-normalized centroids).
+        Data will be normalized and distance computed as negative dot products.
     """
 
     def __init__(
@@ -227,6 +257,7 @@ class FastKMeans:
         verbose: bool = False,
         nredo: int = 1,  # for compatibility only
         use_triton: bool | None = None,
+        spherical: bool = False,
     ):
         self.d = d
         self.k = k
@@ -247,10 +278,11 @@ class FastKMeans:
         if use_triton and not HAS_TRITON:
             raise ValueError("Triton is not available. Please install Triton and try again.")
         self.use_triton = use_triton
+        self.spherical = spherical
         if nredo != 1:
             raise ValueError("nredo must be 1, redos not currently supported")
 
-    def train(self, data: np.ndarray):
+    def train(self, data: np.ndarray, init_centroids: torch.Tensor | None = None):
         """
         Trains (fits) the KMeans model on the given data and sets `self.centroids`. Designed to mimic faiss's `train()` method.
 
@@ -284,14 +316,16 @@ class FastKMeans:
             max_points_per_centroid=self.max_points_per_centroid,
             verbose=self.verbose,
             use_triton=self.use_triton,
+            init_centroids=init_centroids,
+            spherical=self.spherical,
         )
         self.centroids = centroids.numpy()
 
-    def fit(self, data: np.ndarray):
+    def fit(self, data: np.ndarray, init_centroids: torch.Tensor | None = None):
         """
         Same as train(), included for interface similarity with scikit-learn's `fit()`.
         """
-        self.train(data)
+        self.train(data, init_centroids=init_centroids)
         return self
 
     def predict(self, data: np.ndarray) -> np.ndarray:
